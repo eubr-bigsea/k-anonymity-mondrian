@@ -203,7 +203,7 @@ case class Mondrian(data: Dataset[Row], k: Int,
         val Array((lhsMember, lhsMemberCount), (rhsMember, rhsMemberCount)) =
           Array(lhsIdxs, rhsIdxs).par.map { idxs =>
             val member = partition.member.
-              join(idxs, s"${qiColumns(dim)}").cache
+              join(broadcast(idxs), s"${qiColumns(dim)}").cache
             (member, member.count)
           }.toArray
         
@@ -228,7 +228,88 @@ case class Mondrian(data: Dataset[Row], k: Int,
   private def anonymizeRelaxed(qiColumns: Array[String],
       qiOrder: Array[Array[Int]], qiRange: Array[Double],
       partition: Partition,
-      k: Int): Vector[Partition] = ???
+      k: Int): Vector[Partition] = time {
+    println (s"anonymizeRelaxed ${partition}")
+
+    val allowCount = partition.allow.sum
+    if (allowCount == 0) {
+      return Vector(partition)
+    }
+
+    val dim = chooseDimension(qiColumns, qiOrder, qiRange, partition)
+    assert (dim != -1,
+      s"${qiColumns.toSeq} ${qiOrder.toSeq} ${qiRange} ${partition}")
+
+    val (splitValOpt, nextValOpt, lowOpt, highOpt) = findMedian(
+        qiColumns, partition, dim, k)
+
+    val order = qiOrder(dim)
+
+    if (lowOpt.isDefined) {
+      val firstIdx = Arrays.binarySearch(order, lowOpt.get)
+      val secondIdx = Arrays.binarySearch(order, highOpt.get)
+      val firstAtt = order(firstIdx)
+      val secondAtt = order(secondIdx)
+      partition.low(dim) = firstIdx
+      partition.high(dim) = secondIdx
+    }
+
+    if (!splitValOpt.isDefined) {
+      partition.allow(dim) = 0
+      return anonymizeRelaxed(qiColumns, qiOrder, qiRange, partition, k)
+    } else {
+      val mean = Arrays.binarySearch(order, splitValOpt.get)
+      val nextValIdx = Arrays.binarySearch(order, nextValOpt.get)
+
+      val lhsHigh = new Array[Int](partition.high.length)
+      Array.copy(partition.high, 0, lhsHigh, 0, lhsHigh.length)
+      lhsHigh(dim) = mean
+
+      val rhsLow = new Array[Int](partition.low.length)
+      Array.copy(partition.low, 0, rhsLow, 0, rhsLow.length)
+      rhsLow(dim) = nextValIdx
+
+      import partition.member.sparkSession.implicits._
+
+      val lhsIdxs = partition.member.sparkSession.sparkContext.
+        parallelize (order.slice(0, mean)).
+        toDF(s"${qiColumns(dim)}")
+
+      val rhsIdxs = partition.member.sparkSession.sparkContext.
+        parallelize (order.slice(mean + 1, order.length)).
+        toDF(s"${qiColumns(dim)}")
+
+      val midIdxs = partition.member.sparkSession.sparkContext.
+        parallelize (order.slice(mean, mean + 1)).
+        toDF(s"${qiColumns(dim)}")
+
+      val Array(_lhsMember, _midMember, _rhsMember) =
+        Array(lhsIdxs, midIdxs, rhsIdxs).par.map { idxs =>
+          val member = partition.member.
+            join(broadcast(idxs), s"${qiColumns(dim)}").cache
+          member
+        }.toArray
+
+      val halfSize = partition.memberCount / 2
+      val Array(lSplit, rSplit) = _midMember.randomSplit(Array(0.5, 0.5))
+      val lhsMember = _lhsMember.union(lSplit)
+      val lhsMemberCount = lhsMember.count
+      val rhsMember = _rhsMember.union(rSplit)
+      val rhsMemberCount = rhsMember.count
+
+      val lhs = Partition(lhsMember, lhsMemberCount, partition.low, lhsHigh)
+      val rhs = Partition(rhsMember, rhsMemberCount, rhsLow, partition.high)
+      if (!rSplit.rdd.isEmpty) {
+        rhs.low(dim) = mean
+      }
+
+      val Array(lhsRes, rhsRes) = Array(lhs, rhs).par.map { hs =>
+        anonymizeRelaxed(qiColumns, qiOrder, qiRange, hs, k)
+      }.toArray
+
+      return lhsRes ++ rhsRes
+    }
+  }
 }
 
 object Mondrian {

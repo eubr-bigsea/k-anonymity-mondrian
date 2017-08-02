@@ -13,6 +13,7 @@ object DemographicsApp extends Timeable {
     val demographicsPath = args(0)
     val conditionsPath = args(1)
     val k = args(2).toInt
+    val mode = args(3)
 
     val spark = SparkSession.builder().
       master("local[4]").
@@ -26,12 +27,15 @@ object DemographicsApp extends Timeable {
 
     val data = formatDemographicsData(demographics, conditions).cache
 
-    val res = new Mondrian(data, k).result
-    println (s"result = ${res}")
-    res.resultDataset.cache
-    println (s"number of anonymized records = ${res.resultDataset.count}")
-    res.resultDataset.show
-    println (s"ncp = ${res.ncp}")
+    time {
+      val res = new Mondrian(data, k, mode).result
+      println (s"result = ${res}")
+      res.resultDataset.cache
+      println (s"number of anonymized records = ${res.resultDataset.count}")
+      res.resultDataset.show
+      println (s"ncp = ${res.ncp}")
+    } ("mondrian")
+
     spark.stop()
   }
 
