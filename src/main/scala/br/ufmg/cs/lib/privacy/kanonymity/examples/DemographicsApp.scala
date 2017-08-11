@@ -25,16 +25,23 @@ object DemographicsApp extends Timeable {
     val demographics = readDemographics(spark, demographicsPath)
     val conditions = readConditions(spark, conditionsPath)
 
-    val data = formatDemographicsData(demographics, conditions).cache
+    val rawData = formatDemographicsData(demographics, conditions).cache
 
-    time {
-      val res = new Mondrian(data, k, mode).result
-      println (s"result = ${res}")
-      res.resultDataset.cache
-      println (s"number of anonymized records = ${res.resultDataset.count}")
-      res.resultDataset.show
-      println (s"ncp = ${res.ncp}")
-    } ("mondrian")
+    val keyColumns = List("dobmm", "dobyy", "racex", "educyear", "income")
+    val sensitiveColumns = List("icd9codxs")
+
+    rawData.show
+
+    val mondrian = new Mondrian(rawData, keyColumns, sensitiveColumns, k, mode)
+    val mondrianRes = mondrian.result
+    val resultDataset = mondrianRes.resultDataset.cache
+    println (s"result = ${mondrianRes}")
+    println (s"number of anonymized records = ${resultDataset.count}")
+    resultDataset.show
+    println (s"ncp = ${mondrianRes.ncp}")
+    
+    val resultDatasetRev = mondrianRes.resultDatasetRev 
+    resultDatasetRev.show
 
     spark.stop()
   }
@@ -53,11 +60,11 @@ object DemographicsApp extends Timeable {
     val selectedConditions = conditions.select("dupersid", "icd9codx")
     val conditionsByDupersid = selectedConditions.
       groupBy("dupersid").
-      agg(collect_list("icd9codx").alias("sensitive_data"))
+      agg(collect_list("icd9codx").alias("icd9codxs"))
 
     val joinedDemogConds = selectedDemographics.
       join(conditionsByDupersid, "dupersid").
-      select("dobmm", "dobyy", "racex", "educyear", "income", "sensitive_data")
+      select("dobmm", "dobyy", "racex", "educyear", "income", "icd9codxs")
 
     joinedDemogConds
   }

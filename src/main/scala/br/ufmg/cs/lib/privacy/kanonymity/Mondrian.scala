@@ -5,12 +5,13 @@ import br.ufmg.cs.util.Timeable
 import java.util.Arrays
 
 import org.apache.spark.broadcast.Broadcast
+import org.apache.spark.ml.feature.StringIndexer
 import org.apache.spark.sql.{Dataset, Row, SparkSession}
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.types._
 
+import scala.collection.JavaConverters._
 import scala.collection.immutable.Vector
-import scala.collection.mutable.Map
 import scala.concurrent.{Await, Future}
 import scala.concurrent.ExecutionContext.Implicits.global
 import scala.concurrent.duration._
@@ -22,12 +23,13 @@ import scala.concurrent.duration._
  */
 case class MondrianResult(mondrian: Mondrian,
     partitions: Vector[Partition]) extends Timeable {
+
   import Mondrian._
   private val spark = mondrian.wholePartition.member.sparkSession
 
-  /**
+    /**
    * Evaluates this result:
-   * - resultDataset: anonymized data
+   * - resultDataset: anonymized data (indexed)
    * - ncp: normalized certainty penalty
    */
   lazy val (resultDataset, ncp): (Dataset[Row], Double) = time {
@@ -46,18 +48,15 @@ case class MondrianResult(mondrian: Mondrian,
         i => getNormalizedWidth(qiColumns, qiOrder, qiRange, partition, i)
       ).sum * partition.memberCount
       val _dp: Double = scala.math.pow(partition.memberCount, 2)
-
+    
       val partial = partition.member.rdd.map { r =>
         val originalFields = r.toSeq
-        val fields = new Array[Any](originalFields.size)
+        val fields = new Array[Any](2 * originalFields.size - 1)
+        fields(0) = originalFields(r.fieldIndex("sensitive_data"))
         var i = 0
         while (i < qiOrderBc.value.length) {
-          fields(i) = Row.fromTuple((qiOrderBc.value(i)(lowBc.value(i)),
-            qiOrderBc.value(i)(highBc.value(i))))
-          i += 1
-        }
-        while (i < originalFields.length) {
-          fields(i) = originalFields(i)
+          fields(2*i+1) = qiOrderBc.value(i)(lowBc.value(i))
+          fields(2*i+2) = qiOrderBc.value(i)(highBc.value(i))
           i += 1
         }
         Row.fromSeq(fields.toSeq)
@@ -73,17 +72,46 @@ case class MondrianResult(mondrian: Mondrian,
     ncp = ncp / mondrian.wholePartition.memberCount
     ncp = ncp * 100
 
-    val qiSchema = qiColumns.map (
-      c => StructField(c, StructType(StructField("low", IntegerType) ::
-        StructField("high", IntegerType) :: Nil))
+    val qiSchema = qiColumns.flatMap (
+      c => Seq(StructField(s"${c}_low", DoubleType),
+        StructField(s"${c}_high", DoubleType))
     )
 
-    val schema = StructType (qiSchema ++
-      Array(mondrian.wholePartition.member.schema("sensitive_data")))
+    val schema = StructType (
+      Array(mondrian.wholePartition.member.schema("sensitive_data")) ++
+      qiSchema)
 
     val resultDataframe = spark.createDataFrame(resultDataset, schema)
 
     (resultDataframe, ncp)
+  }
+
+  /**
+   * Anonymized data in its original form, i.e., not indexed.
+   */
+  lazy val resultDatasetRev = {
+    val indexersRev = mondrian.indexersRev
+
+    // broadcast the mappings between indexes and strings w.r.t. the keyColumns
+    // fields
+    val indexersRevBc = resultDataset.sparkSession.
+      sparkContext.broadcast(indexersRev)
+
+    var resultDatasetRev = resultDataset
+    indexersRev.keys.foreach { c =>
+      // create udf for this column
+      val indexToString = udf((idx: Double) => { indexersRevBc.value(c)(idx) })
+
+      // convert low from index back to string
+      resultDatasetRev = resultDatasetRev.withColumn(s"${c}_low",
+        indexToString(col(s"${c}_idx_low"))).drop(s"${c}_idx_low")
+
+      // convert high from index back to string
+      resultDatasetRev = resultDatasetRev.withColumn(s"${c}_high",
+        indexToString(col(s"${c}_idx_high"))).drop(s"${c}_idx_high")
+    }
+
+    resultDatasetRev
   }
 }
 
@@ -94,13 +122,22 @@ case class MondrianResult(mondrian: Mondrian,
  * @param k k-anonymity parameter
  * @param mode supported modes: ["strict", "relaxed"]
  */
-case class Mondrian(data: Dataset[Row], k: Int,
-    mode: String = Mondrian.STRICT) extends Timeable {
+case class Mondrian(rawData: Dataset[Row],
+    keyColumns: List[String] = Nil, sensitiveColumns: List[String] = Nil,
+    k: Int = 10, mode: String = Mondrian.STRICT) extends Timeable {
+
+  def this(rawData: Dataset[Row], keyColumns: java.util.ArrayList[String],
+      sensitiveColumns: java.util.ArrayList[String], k: java.lang.Integer,
+      mode: java.lang.String) {
+    this(rawData, keyColumns.asScala.toList, sensitiveColumns.asScala.toList,
+      k.intValue, mode)
+  }
 
   import Mondrian._
 
+  val (indexersRev, data) = preProcess(rawData, keyColumns, sensitiveColumns)
   val qiColumns = data.drop("idx", "sensitive_data").columns
-  val qiOrder = new Array[Array[Int]](qiColumns.length)
+  val qiOrder = new Array[Array[Double]](qiColumns.length)
   val qiRange = new Array[Double](qiColumns.length)
   var wholePartition: Partition = _
 
@@ -111,7 +148,7 @@ case class Mondrian(data: Dataset[Row], k: Int,
         dropDuplicates().
         sort(qiColumns(i)).
         rdd.
-        map(r => r.getInt(0)).
+        map { r => r.getDouble(0) }.
         collect
 
       qiRange(i) = qiOrder(i)(qiOrder(i).length - 1) - qiOrder(i)(0)
@@ -138,8 +175,39 @@ case class Mondrian(data: Dataset[Row], k: Int,
     MondrianResult(this, partitions)
   }
 
+  def preProcess(rawData: Dataset[Row],
+      keyColumns: List[String],
+      sensitiveColumns: List[String])
+    : (Map[String,Map[Double,String]], Dataset[Row]) = {
+    
+    val allColumns = keyColumns ++ sensitiveColumns
+
+    val data = rawData.
+      select(allColumns.head, allColumns.tail:_*).
+      withColumn("sensitive_data",
+        struct(sensitiveColumns.head, sensitiveColumns.tail:_*)).
+      drop(sensitiveColumns:_*)
+
+    val indexers = keyColumns.map(
+      c => (c,
+        new StringIndexer().setInputCol(c).setOutputCol(s"${c}_idx").fit(data))
+      ).toMap
+
+    var indexed = data
+    keyColumns.foreach { c =>
+      indexed = indexers(c).transform(indexed).drop(c)
+    }
+
+    val indexersRev = keyColumns.map { c =>
+      (c, ((0.0 until indexers(c).labels.length.toDouble by 1.0).zip(
+        indexers(c).labels)).toMap)
+    }.toMap
+
+    (indexersRev, indexed)
+  }
+
   private def anonymizeStrict(qiColumns: Array[String],
-      qiOrder: Array[Array[Int]], qiRange: Array[Double],
+      qiOrder: Array[Array[Double]], qiRange: Array[Double],
       partition: Partition,
       k: Int): Vector[Partition] = time {
     println (s"anonymizeStrict ${partition}")
@@ -226,7 +294,7 @@ case class Mondrian(data: Dataset[Row], k: Int,
   }
 
   private def anonymizeRelaxed(qiColumns: Array[String],
-      qiOrder: Array[Array[Int]], qiRange: Array[Double],
+      qiOrder: Array[Array[Double]], qiRange: Array[Double],
       partition: Partition,
       k: Int): Vector[Partition] = time {
     println (s"anonymizeRelaxed ${partition}")
@@ -320,14 +388,14 @@ object Mondrian {
   def findMedian(qiColumns: Array[String],
       partition: Partition,
       dim: Int,
-      k: Int): (Option[Int], Option[Int],
-                Option[Int], Option[Int]) = {
+      k: Int): (Option[Double], Option[Double],
+                Option[Double], Option[Double]) = {
 
-    var splitValOpt: Option[Int] = None
-    var nextValOpt: Option[Int] = None
+    var splitValOpt: Option[Double] = None
+    var nextValOpt: Option[Double] = None
     val frequency = frequencySet(qiColumns, partition, dim)
     val frequencyLocal = frequency.rdd.map {
-      case Row(att: Int, frequency: Long) => (att, frequency)
+      case Row(att: Double, frequency: Long) => (att, frequency)
     }.collect
     val total = frequencyLocal.map(_._2).sum
     val middle = total / 2
@@ -380,7 +448,7 @@ object Mondrian {
 
   def getNormalizedWidth(
       qiColumns: Array[String],
-      qiOrder: Array[Array[Int]],
+      qiOrder: Array[Array[Double]],
       qiRange: Array[Double],
       partition: Partition,
       index: Int): Double = {
@@ -394,7 +462,7 @@ object Mondrian {
 
   def chooseDimension(
       qiColumns: Array[String],
-      qiOrder: Array[Array[Int]],
+      qiOrder: Array[Array[Double]],
       qiRange: Array[Double],
       partition: Partition): Int = {
     var maxWidth = Double.MinValue
