@@ -51,12 +51,13 @@ case class MondrianResult(mondrian: Mondrian,
     
       val partial = partition.member.rdd.map { r =>
         val originalFields = r.toSeq
-        val fields = new Array[Any](2 * originalFields.size - 1)
-        fields(0) = originalFields(r.fieldIndex("sensitive_data"))
+        val fields = new Array[Any](originalFields.size)
+        fields(0) = originalFields(r.fieldIndex("idx"))
+        fields(1) = originalFields(r.fieldIndex("sensitive_data"))
         var i = 0
         while (i < qiOrderBc.value.length) {
-          fields(2*i+1) = qiOrderBc.value(i)(lowBc.value(i))
-          fields(2*i+2) = qiOrderBc.value(i)(highBc.value(i))
+          fields(i+2) = Row.fromTuple((qiOrderBc.value(i)(lowBc.value(i)),
+            qiOrderBc.value(i)(highBc.value(i))))
           i += 1
         }
         Row.fromSeq(fields.toSeq)
@@ -72,14 +73,14 @@ case class MondrianResult(mondrian: Mondrian,
     ncp = ncp / mondrian.wholePartition.memberCount
     ncp = ncp * 100
 
-    val qiSchema = qiColumns.flatMap (
-      c => Seq(StructField(s"${c}_low", DoubleType),
-        StructField(s"${c}_high", DoubleType))
-    )
+    val qiSchema = qiColumns.map (
+      c => StructField(c, StructType(StructField("low", DoubleType) ::
+        StructField("high", DoubleType) :: Nil)))
 
     val schema = StructType (
-      Array(mondrian.wholePartition.member.schema("sensitive_data")) ++
-      qiSchema)
+      Array(
+        mondrian.wholePartition.member.schema("idx"),
+        mondrian.wholePartition.member.schema("sensitive_data")) ++ qiSchema)
 
     val resultDataframe = spark.createDataFrame(resultDataset, schema)
 
@@ -87,7 +88,8 @@ case class MondrianResult(mondrian: Mondrian,
   }
 
   /**
-   * Anonymized data in its original form, i.e., not indexed.
+   * Anonymized data in its original form, i.e., not indexed. This contains only
+   * the fields used in the anonymization process
    */
   lazy val resultDatasetRev = {
     val indexersRev = mondrian.indexersRev
@@ -102,17 +104,27 @@ case class MondrianResult(mondrian: Mondrian,
       // create udf for this column
       val indexToString = udf((idx: Double) => { indexersRevBc.value(c)(idx) })
 
-      // convert low from index back to string
-      resultDatasetRev = resultDatasetRev.withColumn(s"${c}_low",
-        indexToString(col(s"${c}_idx_low"))).drop(s"${c}_idx_low")
-
       // convert high from index back to string
-      resultDatasetRev = resultDatasetRev.withColumn(s"${c}_high",
-        indexToString(col(s"${c}_idx_high"))).drop(s"${c}_idx_high")
+      resultDatasetRev = resultDatasetRev.withColumn(c,
+        struct(
+          indexToString(col(s"${c}_idx.low")),
+          indexToString(col(s"${c}_idx.high")))).drop(s"${c}_idx")
     }
 
     resultDatasetRev
   }
+
+  /**
+   * Anonymized data, same schema as the input. Key columns will be presented as
+   * a range of values, e.g., col1 would be transformed into
+   * [col1.low, col1.high]
+   */
+  lazy val anonymizedData = {
+    val originalIndexed = mondrian.rawDataIndexed.drop(mondrian.keyColumns:_*)
+    val resultIndexed = resultDatasetRev.drop("sensitive_data")
+    originalIndexed.join(resultIndexed, "idx").drop("idx")
+  }
+
 }
 
 /**
@@ -135,11 +147,15 @@ case class Mondrian(rawData: Dataset[Row],
 
   import Mondrian._
 
-  val (indexersRev, data) = preProcess(rawData, keyColumns, sensitiveColumns)
+  val rawDataIndexed = rawData.withColumn("idx", monotonicallyIncreasingId)
+  val (indexersRev, data) = preProcess(rawDataIndexed,
+    keyColumns, sensitiveColumns)
   val qiColumns = data.drop("idx", "sensitive_data").columns
   val qiOrder = new Array[Array[Double]](qiColumns.length)
   val qiRange = new Array[Double](qiColumns.length)
   var wholePartition: Partition = _
+
+  data.show
 
   lazy val result: MondrianResult = {
     (0 until qiColumns.length).par.foreach { i =>
@@ -183,7 +199,7 @@ case class Mondrian(rawData: Dataset[Row],
     val allColumns = keyColumns ++ sensitiveColumns
 
     val data = rawData.
-      select(allColumns.head, allColumns.tail:_*).
+      select("idx", allColumns:_*).
       withColumn("sensitive_data",
         struct(sensitiveColumns.head, sensitiveColumns.tail:_*)).
       drop(sensitiveColumns:_*)

@@ -27,7 +27,6 @@ object SiapeApp extends Timeable {
     spark.sparkContext.setLogLevel("WARN")
 
     val rawData = readSiape(spark, siapePath)
-    rawData.show
 
     val mondrian = new Mondrian(rawData, keyColumns, sensitiveColumns, k, mode)
     val mondrianRes = mondrian.result
@@ -39,6 +38,9 @@ object SiapeApp extends Timeable {
 
     val resultDatasetRev = mondrianRes.resultDatasetRev 
     resultDatasetRev.show
+
+    val anonymizedData = mondrianRes.anonymizedData
+    anonymizedData.show
     
     spark.stop()
   }
