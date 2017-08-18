@@ -78,7 +78,7 @@ object SiapeApp extends Timeable {
 
   def readSiape(spark: SparkSession, path: String): Dataset[Row] = {
     import spark.implicits._
-    val conditions = spark.sparkContext.textFile(path).
+    val siape = spark.sparkContext.textFile(path).
       map(_ split ",").flatMap { fields =>
         try {
           Iterator(SiapeRecord(
@@ -136,6 +136,6 @@ object SiapeApp extends Timeable {
           iter
         }
       }.toDF()
-    conditions
+    siape
   }
 }
